@@ -1,5 +1,7 @@
 # Roblox .gitignore
 
+.DS_Store
+
 .env
 env.luau
 *.code-workspace
