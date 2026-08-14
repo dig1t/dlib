@@ -7,7 +7,7 @@
 
 	Install with wally by adding the following to your `wally.toml`:
 	```toml
-	Signal = "dig1t/signal@1.0.3"
+	Signal = "dig1t/signal@1.0.4"
 	```
 ]=]
 
@@ -16,8 +16,6 @@
 
 local HttpService = game:GetService("HttpService")
 local RunService = game:GetService("RunService")
-
-local Util = require(script.Parent.Util)
 
 local SIZE_LIMIT: number = 0 -- The maximum number of events that can be stored in the buffer before being fired.
 local BUFFER_TIME: number = 0 -- The time in seconds before the buffer is automatically fired.
@@ -56,9 +54,15 @@ export type Connection<T...> = RBXScriptConnection & typeof(setmetatable(
 ]=]
 export type Callback<T...> = (T...) -> ()
 
+-- Monotonic counter; random IDs could collide and silently
+-- disconnect an unrelated connection
+local nextConnectionId: number = 0
+
 function Connection.new<T...>(signal: Signal<T...>, callback: Callback<T...>): Connection<T...>
+	nextConnectionId += 1
+
 	return setmetatable({
-		_connectionId = Util.randomString(8),
+		_connectionId = tostring(nextConnectionId),
 		_signal = signal,
 		_callback = callback,
 
@@ -155,10 +159,19 @@ end
 	@param ... tuple -- The arguments to pass to the signal
 ]=]
 function Signal.Fire<T...>(self: Signal<T...>, ...)
-	local count: number? = getTableCharacterCount(self._buffer)
+	-- Measure only the new arguments; encoding the whole buffer
+	-- every fire was O(n^2) and used a stale count
+	local count: number? = self.bufferEnabled and getTableCharacterCount({ ... }) or nil
 
 	if not count or not self.bufferEnabled then
-		for _, connection in pairs(self._connections) do
+		-- Flush queued events first so delivery stays in order
+		if self._bufferSize > 0 then
+			self:_flush()
+		end
+
+		-- Snapshot so handlers that connect/disconnect during the
+		-- fire don't mutate the table mid-iteration
+		for _, connection in pairs(table.clone(self._connections)) do
 			if connection.Connected then
 				task.spawn(connection._callback, ...)
 			end
@@ -195,19 +208,24 @@ end
 function Signal._flush<T...>(self: Signal<T...>)
 	self:_stopTimer()
 
-	-- Equivalent of running signal:Fire()
-	for _, connection in pairs(self._connections) do
-		if connection.Connected then
-			for _, args in self._buffer do
-				task.spawn(connection._callback, unpack(args))
-			end
-		end
-	end
+	-- Snapshot and clear the buffer before dispatching; a handler that
+	-- fires this signal again must start a fresh buffer, not redeliver
+	-- the events already in flight (infinite recursion otherwise)
+	local buffer = self._buffer
 
 	self._buffer = {}
 	self._bufferSize = 0
 	self._charCount = 0
 	self._elapsedTime = 0
+
+	-- Equivalent of running signal:Fire()
+	for _, connection in pairs(table.clone(self._connections)) do
+		if connection.Connected then
+			for _, args in buffer do
+				task.spawn(connection._callback, unpack(args))
+			end
+		end
+	end
 end
 
 function Signal._startTimer<T...>(self: Signal<T...>)
@@ -363,6 +381,11 @@ end
 ]=]
 function Signal.Destroy<T...>(self: Signal<T...>)
 	self:_stopTimer()
+
+	-- Deliver any buffered events before disconnecting
+	if self._bufferSize > 0 then
+		self:_flush()
+	end
 
 	-- Clear connections
 	for _, connection in pairs(self._connections) do
